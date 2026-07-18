@@ -1,0 +1,118 @@
+import os
+import torch
+import shutil
+from pathlib import Path
+
+from datasets import load_dataset
+from transformers import AutoModelForCausalLM, AutoTokenizer
+
+from llmcompressor import oneshot
+# GPTQ 대신 QuantizationModifier를 사용합니다.
+from llmcompressor.modifiers.quantization import QuantizationModifier
+
+# ==========================================
+# 1. Setting (A8W8 설정으로 변경)
+# ==========================================
+MODEL_ID = "/content/drive/MyDrive/base_model" # 드라이브 경로 확인 필수
+OUT_DIR  = "./model"
+
+DATASET_ID = "LGAI-EXAONE/MANTA-1M"
+DATASET_SPLIT = "train"
+
+NUM_CALIBRATION_SAMPLES = 256
+MAX_SEQUENCE_LENGTH = 256
+
+# A8W8 양자화 스킴 설정
+SCHEME = "W8A8"  # Weight 8-bit, Activation 8-bit
+TARGETS = ["Linear"]
+IGNORE  = ["embed_tokens", "lm_head"]
+
+# ==========================================
+# 2. Model Loads
+# ==========================================
+print("[INFO] 모델 로드 중...")
+tokenizer = AutoTokenizer.from_pretrained(
+    MODEL_ID,
+    trust_remote_code=True,
+)
+
+model = AutoModelForCausalLM.from_pretrained(
+    MODEL_ID,
+    torch_dtype=torch.bfloat16,
+    trust_remote_code=True, # 평가 서버 환경을 위해 명시
+)
+
+print("[INFO] 모델/토크나이저 로드 완료")
+
+# ==========================================
+# 3. Dataset Loads & Preprocess
+# ==========================================
+print("[INFO] 캘리브레이션 데이터 로드 및 전처리 중...")
+
+ds = load_dataset(
+    DATASET_ID,
+    split=f"{DATASET_SPLIT}[:{NUM_CALIBRATION_SAMPLES}]",
+)
+
+def preprocess(example):
+    return {
+        "text": tokenizer.apply_chat_template(
+            example["conversations"],
+            add_generation_prompt=True,
+            tokenize=False)
+    }
+
+ds = ds.map(preprocess)
+
+# ==========================================
+# 4. A8W8 Quantization (GPTQ 대신 적용)
+# ==========================================
+print(f"[INFO] A8W8 양자화 시작 (scheme={SCHEME})...")
+
+# GPTQModifier 대신 QuantizationModifier를 사용하여 A8W8 적용
+recipe = [
+    QuantizationModifier(
+        scheme=SCHEME,
+        targets=TARGETS,
+        ignore=IGNORE,
+    )
+]
+
+oneshot(
+    model=model,
+    dataset=ds,
+    recipe=recipe,
+    max_seq_length=MAX_SEQUENCE_LENGTH,
+    num_calibration_samples=NUM_CALIBRATION_SAMPLES,
+)
+
+print("[INFO] 양자화 완료")
+
+# ==========================================
+# 5. Model Save & Submission (규격 준수)
+# ==========================================
+os.makedirs(OUT_DIR, exist_ok=True)
+
+# 모델 저장 (A8W8은 save_compressed=True가 필요할 수 있음)
+model.save_pretrained(OUT_DIR, save_compressed=True)
+tokenizer.save_pretrained(OUT_DIR)
+
+# [중요] 평가 서버는 인터넷이 안 되므로 base_model의 .py 파일들을 model 폴더로 복사
+for file in os.listdir(MODEL_ID):
+    if file.endswith(".py"):
+        shutil.copy(os.path.join(MODEL_ID, file), os.path.join(OUT_DIR, file))
+
+print(f"[INFO] 모델 및 관련 스크립트 저장 완료: {OUT_DIR}")
+
+# ZIP 압축
+zip_name = "baseline_submit"
+print(f"[INFO] {zip_name}.zip 생성 중...")
+
+shutil.make_archive(
+    base_name=zip_name,
+    format="zip",
+    root_dir=".",        # 현재 디렉토리 기준
+    base_dir=OUT_DIR[2:] # "model" 폴더만 포함 (./ 제거)
+)
+
+print(f"✅ 생성 완료: {zip_name}.zip")
